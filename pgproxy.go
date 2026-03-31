@@ -14,7 +14,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/binary"
 	"expvar"
 	"flag"
 	"fmt"
@@ -27,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	pgproto3 "github.com/jackc/pgproto3/v2"
 	"tailscale.com/client/local"
 	"tailscale.com/metrics"
 	"tailscale.com/tsnet"
@@ -197,13 +197,13 @@ var (
 
 // serve proxies the postgres client on c to the proxy's upstream,
 // enforcing strict TLS to the upstream.
-func (p *proxy) serve(sessionID int64, c net.Conn) error {
-	defer c.Close()
+func (p *proxy) serve(sessionID int64, clientConn net.Conn) error {
+	defer clientConn.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	whois, err := p.client.WhoIs(ctx, c.RemoteAddr().String())
+	whois, err := p.client.WhoIs(ctx, clientConn.RemoteAddr().String())
 	if err != nil {
 		p.errors.Add("whois-failed", 1)
 		return fmt.Errorf("getting client identity: %v", err)
@@ -228,17 +228,17 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 		p.errors.Add("no-ts-identity", 1)
 		return fmt.Errorf("couldn't identify source user and machine (user %q, machine %q)", tailscaleUser, machine)
 	}
-	log.Printf("%d: session start, from %s (machine %s, user %s)", sessionID, c.RemoteAddr(), machine, tailscaleUser)
+	log.Printf("%d: session start, from %s (machine %s, user %s)", sessionID, clientConn.RemoteAddr(), machine, tailscaleUser)
 	start := time.Now()
 	defer func() {
 		elapsed := time.Since(start)
-		log.Printf("%d: session end, from %s (machine %s, user %s), lasted %s", sessionID, c.RemoteAddr(), machine, tailscaleUser, elapsed.Round(time.Millisecond))
+		log.Printf("%d: session end, from %s (machine %s, user %s), lasted %s", sessionID, clientConn.RemoteAddr(), machine, tailscaleUser, elapsed.Round(time.Millisecond))
 	}()
 
 	// Read the client's opening message, to figure out if it's trying
 	// to TLS or not.
 	var buf [8]byte
-	if _, err := io.ReadFull(c, buf[:len(sslStart)]); err != nil {
+	if _, err := io.ReadFull(clientConn, buf[:len(sslStart)]); err != nil {
 		p.errors.Add("network-error", 1)
 		return fmt.Errorf("initial magic read: %v", err)
 	}
@@ -246,8 +246,10 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 	switch {
 	case buf == sslStart:
 		clientIsTLS = true
+		log.Print("TLS is enabled")
 	case buf == plaintextStart:
 		clientIsTLS = false
+		log.Print("TLS is disabled")
 	default:
 		p.errors.Add("client-bad-protocol", 1)
 		return fmt.Errorf("unrecognized initial packet = % 02x", buf)
@@ -280,16 +282,20 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 		MinVersion: tls.VersionTLS12,
 	}
 	upstreamTLSConn := tls.Client(upstreamConn, tlsConf)
+	// No need to "defer Close" upstreamTLSConn
 	if err = upstreamTLSConn.HandshakeContext(ctx); err != nil {
 		p.errors.Add("upstream-tls", 1)
 		return fmt.Errorf("upstream TLS handshake: %v", err)
 	}
+	log.Print("Upstream TLS handshake complete")
+
+	// This proxy acts as backend for the client connection
+	var backend *pgproto3.Backend
 
 	// Accept the client conn and set it up the way the client wants.
-	var clientConn net.Conn
 	if clientIsTLS {
-		io.WriteString(c, "S") // yeah, we're good to speak TLS
-		s := tls.Server(c, &tls.Config{
+		io.WriteString(clientConn, "S") // yeah, we're good to speak TLS
+		secureClientConn := tls.Server(clientConn, &tls.Config{
 			ServerName:   p.upstreamHost,
 			Certificates: p.downstreamCert,
 			MinVersion:   tls.VersionTLS12,
@@ -298,36 +304,41 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 			p.errors.Add("client-tls", 1)
 			return fmt.Errorf("client TLS handshake: %v", err)
 		}
-		clientConn = s
+		backend = pgproto3.NewBackend(pgproto3.NewChunkReader(secureClientConn), secureClientConn)
 	} else {
-		clientConn = c
+		// For non-TLS connections the first 8 bytes were already consumed; prepend them.
+		clientReader := io.MultiReader(bytes.NewReader(plaintextStart[:]), clientConn)
+		backend = pgproto3.NewBackend(pgproto3.NewChunkReader(clientReader), clientConn)
 	}
+
+	// This proxy acts as frontend to the upstream database server
+	frontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(upstreamTLSConn), upstreamTLSConn)
 
 	// If the connecting Tailscale user is a GMail address, substitute credentials
 	// with fixed values regardless of what the client sends.
 	if strings.HasSuffix(tailscaleUser, "@gmail.com") {
-		if err := p.interceptAuth(clientConn, upstreamTLSConn, clientIsTLS, tailscaleUser); err != nil {
-			p.errors.Add("auth-intercept", 1)
-			return fmt.Errorf("auth intercept for %s: %v", tailscaleUser, err)
-		}
-	} else if !clientIsTLS {
-		// For non-intercepted plaintext sessions, forward the startup header we already read.
-		if _, err := upstreamTLSConn.Write(plaintextStart[:]); err != nil {
-			p.errors.Add("network-error", 1)
-			return fmt.Errorf("sending initial client bytes to upstream: %v", err)
-		}
+		log.Printf("Recognized user %s", tailscaleUser)
+	} else {
+
 	}
+	err = p.interceptAuth(frontend, backend, tailscaleUser)
+	if err != nil {
+		p.errors.Add("auth-intercept", 1)
+		return fmt.Errorf("auth intercept for %s: %v", tailscaleUser, err)
+	}
+
+	log.Print("Started proxying data")
 
 	// Finally, proxy the client to the upstream.
 	errc := make(chan error, 1)
 	go func() {
 		// Proxy requests to the Postgres server, logging SQL statements.
-		err := logAndProxy(sessionID, upstreamTLSConn, clientConn)
+		err := logAndProxy(sessionID, frontend, backend)
 		errc <- err
 	}()
 	go func() {
 		// Proxy responses back to the client.
-		_, err := io.Copy(clientConn, upstreamTLSConn)
+		err := proxyServerResponses(frontend, backend)
 		errc <- err
 	}()
 	if err := <-errc; err != nil {
@@ -343,263 +354,121 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 // logAndProxy reads PostgreSQL wire protocol messages from src, logs any SQL
 // statements ('Q' simple queries and 'P' prepared statements), and forwards
 // all messages verbatim to dst.
-// TODO Consider using a future-proof package that understands
-// the Postgres protocol like https://github.com/jackc/pgx/tree/master/pgproto3
-// instead of performing byte manipulation
-func logAndProxy(sessionID int64, dst io.Writer, src io.Reader) error {
-	var header [5]byte // 1 byte type + 4 bytes length
+func logAndProxy(sessionID int64, frontend *pgproto3.Frontend, backend *pgproto3.Backend) error {
 	for {
-		if _, err := io.ReadFull(src, header[:]); err != nil {
+		msg, err := backend.Receive()
+		if err != nil {
 			return err
 		}
-		msgType := header[0]
-		rawLen := int(binary.BigEndian.Uint32(header[1:5]))
-		if rawLen < 4 {
-			return fmt.Errorf("invalid message length %d for type %q", rawLen, msgType)
+		switch m := msg.(type) {
+		case *pgproto3.Query:
+			log.Printf("%d: query: %s", sessionID, m.String)
+		case *pgproto3.Parse:
+			log.Printf("%d: prepare: %s", sessionID, m.Query)
 		}
-		payloadLen := rawLen - 4
-
-		if _, err := dst.Write(header[:]); err != nil {
+		if err := frontend.Send(msg); err != nil {
 			return err
 		}
-		if payloadLen == 0 {
-			continue
-		}
+	}
+}
 
-		switch msgType {
-		case 'Q': // Simple query — payload is a null-terminated SQL string.
-			payload := make([]byte, payloadLen)
-			if _, err := io.ReadFull(src, payload); err != nil {
-				return err
-			}
-			sql := string(bytes.TrimRight(payload, "\x00"))
-			log.Printf("%d: query: %s", sessionID, sql)
-			if _, err := dst.Write(payload); err != nil {
-				return err
-			}
-		case 'P': // Parse (prepared statement) — payload is: name\0 query\0 ...
-			payload := make([]byte, payloadLen)
-			if _, err := io.ReadFull(src, payload); err != nil {
-				return err
-			}
-			if _, rest, ok := bytes.Cut(payload, []byte{0}); ok {
-				if query, _, ok := bytes.Cut(rest, []byte{0}); ok {
-					log.Printf("%d: prepare: %s", sessionID, query)
-				}
-			}
-			if _, err := dst.Write(payload); err != nil {
-				return err
-			}
-		default:
-			if _, err := io.CopyN(dst, src, int64(payloadLen)); err != nil {
-				return err
-			}
+func proxyServerResponses(frontend *pgproto3.Frontend, backend *pgproto3.Backend) error {
+	for {
+		msg, err := frontend.Receive()
+		if err != nil {
+			return err
+		}
+		if err := backend.Send(msg); err != nil {
+			return err
 		}
 	}
 }
 
 // interceptAuth reads the client's PostgreSQL startup message, rewrites the
-// user field to "ro", forwards it to upstream, handles the upstream auth
-// challenge using the injected password, then sends AuthOk to the client.
-func (p *proxy) interceptAuth(clientConn net.Conn, upstream net.Conn, clientIsTLS bool, tailscaleUser string) error {
-	var startupMsg []byte
-	if clientIsTLS {
-		// After TLS handshake the client sends a fresh startup message.
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(clientConn, lenBuf[:]); err != nil {
-			return fmt.Errorf("reading startup length: %v", err)
-		}
-		msgLen := int(binary.BigEndian.Uint32(lenBuf[:]))
-		if msgLen < 8 || msgLen > 65536 {
-			return fmt.Errorf("invalid startup message length: %d", msgLen)
-		}
-		startupMsg = make([]byte, msgLen)
-		copy(startupMsg, lenBuf[:])
-		if _, err := io.ReadFull(clientConn, startupMsg[4:]); err != nil {
-			return fmt.Errorf("reading startup message: %v", err)
-		}
+// user field, forwards it to upstream, handles the upstream auth challenge
+// using the injected password, then sends AuthOk to the client.
+func (p *proxy) interceptAuth(frontend *pgproto3.Frontend, backend *pgproto3.Backend, tailscaleUser string) error {
+	startupMsg, err := backend.ReceiveStartupMessage()
+
+	if err != nil {
+		return fmt.Errorf("reading startup message: %v", err)
+	}
+	startup, ok := startupMsg.(*pgproto3.StartupMessage)
+	if !ok {
+		return fmt.Errorf("unexpected startup message type: %T", startupMsg)
+	}
+	log.Printf("Received startup message of length with parameters %v", startup.Parameters)
+
+	var postgresUser string
+	var postgresPass string
+	if tailscaleUser == "" { // no tailscale user
+		postgresUser = startup.Parameters["user"]
+		postgresPass = startup.Parameters["password"]
 	} else {
-		// We already read the first 8 bytes (plaintextStart); read the rest.
-		totalLen := int(binary.BigEndian.Uint32(plaintextStart[:4]))
-		if totalLen < 8 || totalLen > 65536 {
-			return fmt.Errorf("invalid startup message length: %d", totalLen)
+		postgresUser = "ro"
+		postgresPass = "my-secret"
+		if tailscaleUser == "foo" { // Here we can check which users have read/write permissions
+			postgresUser = "rw"
+			postgresPass = "do-not-share"
 		}
-		startupMsg = make([]byte, totalLen)
-		copy(startupMsg, plaintextStart[:])
-		if totalLen > 8 {
-			if _, err := io.ReadFull(clientConn, startupMsg[8:]); err != nil {
-				return fmt.Errorf("reading startup message remainder: %v", err)
-			}
+
+		startup.Parameters["user"] = postgresUser
+		if appName, exists := startup.Parameters["application_name"]; exists {
+			startup.Parameters["application_name"] = appName + " - " + tailscaleUser
+		} else {
+			startup.Parameters["application_name"] = tailscaleUser
 		}
 	}
 
-	newStartup, err := rewriteStartupUser(startupMsg, "ro", tailscaleUser)
-	if err != nil {
-		return fmt.Errorf("rewriting startup: %v", err)
-	}
-	if _, err := upstream.Write(newStartup); err != nil {
+	if err := frontend.Send(startup); err != nil {
 		return fmt.Errorf("sending startup to upstream: %v", err)
 	}
-	postgresUser := "ro"
-	postgresPass := "my-secret"
-	if tailscaleUser == "foo" { // Here we can check which users have read/write permissions
-		postgresUser = "rw"
-		postgresPass = "do-not-share"
-	}
-	if err := handleUpstreamAuth(upstream, postgresUser, postgresPass); err != nil {
+
+	if err := handleUpstreamAuth(frontend, postgresUser, postgresPass); err != nil {
 		return fmt.Errorf("upstream auth: %v", err)
 	}
 
-	// Tell the client auth succeeded.
-	// PostgreSQL AuthenticationOk: 'R' + int32(8) + int32(0)
-	authOk := []byte{'R', 0, 0, 0, 8, 0, 0, 0, 0}
-	if _, err := clientConn.Write(authOk); err != nil {
+	if err := backend.Send(&pgproto3.AuthenticationOk{}); err != nil {
 		return fmt.Errorf("sending auth ok to client: %v", err)
 	}
 	return nil
 }
 
-// rewriteStartupUser returns a copy of the PostgreSQL startup message with the
-// "user" parameter replaced by postgresUser. All other parameters are preserved.
-func rewriteStartupUser(msg []byte, postgresUser string, tailscaleUser string) ([]byte, error) {
-	if len(msg) < 8 {
-		return nil, fmt.Errorf("startup message too short (%d bytes)", len(msg))
-	}
-	// msg[0:4] = total length; msg[4:8] = protocol version (preserved)
-	protocol := msg[4:8]
-
-	params := make(map[string]string)
-	keys := make([]string, 0)
-	rest := msg[8:]
-	for len(rest) > 0 && rest[0] != 0 {
-		end := bytes.IndexByte(rest, 0)
-		if end < 0 {
-			return nil, fmt.Errorf("malformed startup message: unterminated key")
-		}
-		key := string(rest[:end])
-		rest = rest[end+1:]
-		end = bytes.IndexByte(rest, 0)
-		if end < 0 {
-			return nil, fmt.Errorf("malformed startup message: unterminated value for %q", key)
-		}
-		val := string(rest[:end])
-		rest = rest[end+1:]
-		if _, exists := params[key]; !exists {
-			keys = append(keys, key)
-		}
-		params[key] = val
-	}
-
-	if _, exists := params["user"]; !exists {
-		keys = append(keys, "user")
-	}
-	params["user"] = postgresUser
-
-	// Append user to application name
-	if _, exists := params["application_name"]; exists {
-		params["application_name"] = params["application_name"] + " - " + tailscaleUser
-	} else {
-		keys = append(keys, "application_name")
-		params["application_name"] = tailscaleUser
-
-	}
-
-	var body []byte
-	body = append(body, protocol...)
-	for _, k := range keys {
-		body = append(body, k...)
-		body = append(body, 0)
-		body = append(body, params[k]...)
-		body = append(body, 0)
-	}
-	body = append(body, 0) // message terminator
-
-	newMsg := make([]byte, 4+len(body))
-	binary.BigEndian.PutUint32(newMsg[:4], uint32(len(newMsg)))
-	copy(newMsg[4:], body)
-	return newMsg, nil
-}
-
 // handleUpstreamAuth handles the PostgreSQL authentication exchange, responding
 // to the upstream's challenge with the given credentials. Returns nil on AuthOk.
-func handleUpstreamAuth(upstream net.Conn, username, password string) error {
-	var typeBuf [1]byte
-	var lenBuf [4]byte
-
-	if _, err := io.ReadFull(upstream, typeBuf[:]); err != nil {
-		return fmt.Errorf("reading auth message type: %v", err)
+func handleUpstreamAuth(frontend *pgproto3.Frontend, username, password string) error {
+	msg, err := frontend.Receive()
+	if err != nil {
+		return fmt.Errorf("reading auth message: %v", err)
 	}
-	if typeBuf[0] != 'R' {
-		return fmt.Errorf("expected auth message ('R'), got %q", typeBuf[0])
-	}
-	if _, err := io.ReadFull(upstream, lenBuf[:]); err != nil {
-		return fmt.Errorf("reading auth message length: %v", err)
-	}
-	bodyLen := int(binary.BigEndian.Uint32(lenBuf[:])) - 4
-	if bodyLen < 4 {
-		return fmt.Errorf("auth message body too short")
-	}
-	body := make([]byte, bodyLen)
-	if _, err := io.ReadFull(upstream, body); err != nil {
-		return fmt.Errorf("reading auth message body: %v", err)
-	}
-
-	authType := binary.BigEndian.Uint32(body[:4])
-	switch authType {
-	case 0:
-		return nil // AuthenticationOk — no password needed
-	case 3:
-		// AuthenticationCleartextPassword
-		pw := append([]byte(password), 0)
-		msg := make([]byte, 5+len(pw))
-		msg[0] = 'p'
-		binary.BigEndian.PutUint32(msg[1:5], uint32(4+len(pw)))
-		copy(msg[5:], pw)
-		if _, err := upstream.Write(msg); err != nil {
+	switch m := msg.(type) {
+	case *pgproto3.AuthenticationOk:
+		log.Print("Authentication successful")
+		return nil
+	case *pgproto3.AuthenticationCleartextPassword:
+		log.Print("Authentication with clear text password")
+		if err := frontend.Send(&pgproto3.PasswordMessage{Password: password}); err != nil {
 			return fmt.Errorf("sending cleartext password: %v", err)
 		}
-	case 5:
-		// AuthenticationMD5Password — salt is body[4:8]
-		if len(body) < 8 {
-			return fmt.Errorf("MD5 auth message too short")
-		}
-		salt := body[4:8]
+	case *pgproto3.AuthenticationMD5Password:
+		log.Print("Authentication with MD5 hashed password")
 		inner := md5.Sum([]byte(password + username))
 		innerHex := fmt.Sprintf("%x", inner)
-		outer := md5.Sum(append([]byte(innerHex), salt...))
+		outer := md5.Sum(append([]byte(innerHex), m.Salt[:]...))
 		hashed := "md5" + fmt.Sprintf("%x", outer)
-		pw := append([]byte(hashed), 0)
-		msg := make([]byte, 5+len(pw))
-		msg[0] = 'p'
-		binary.BigEndian.PutUint32(msg[1:5], uint32(4+len(pw)))
-		copy(msg[5:], pw)
-		if _, err := upstream.Write(msg); err != nil {
+		if err := frontend.Send(&pgproto3.PasswordMessage{Password: hashed}); err != nil {
 			return fmt.Errorf("sending MD5 password: %v", err)
 		}
 	default:
-		return fmt.Errorf("unsupported authentication method: %d", authType)
+		return fmt.Errorf("unsupported authentication method: %T", msg)
 	}
 
-	// Read auth result after sending password.
-	if _, err := io.ReadFull(upstream, typeBuf[:]); err != nil {
-		return fmt.Errorf("reading auth result type: %v", err)
-	}
-	if typeBuf[0] != 'R' {
-		return fmt.Errorf("expected auth result ('R'), got %q", typeBuf[0])
-	}
-	if _, err := io.ReadFull(upstream, lenBuf[:]); err != nil {
-		return fmt.Errorf("reading auth result length: %v", err)
-	}
-	resultBodyLen := int(binary.BigEndian.Uint32(lenBuf[:])) - 4
-	if resultBodyLen < 4 {
-		return fmt.Errorf("auth result body too short")
-	}
-	result := make([]byte, resultBodyLen)
-	if _, err := io.ReadFull(upstream, result); err != nil {
+	result, err := frontend.Receive()
+	if err != nil {
 		return fmt.Errorf("reading auth result: %v", err)
 	}
-	if binary.BigEndian.Uint32(result[:4]) != 0 {
-		return fmt.Errorf("authentication failed")
+	if _, ok := result.(*pgproto3.AuthenticationOk); !ok {
+		return fmt.Errorf("authentication failed: %T", result)
 	}
 	return nil
 }

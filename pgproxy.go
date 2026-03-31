@@ -31,6 +31,8 @@ import (
 	"tailscale.com/metrics"
 	"tailscale.com/tsnet"
 	"tailscale.com/tsweb"
+
+	"go.opentelemetry.io/contrib/bridges/otelslog"
 )
 
 var (
@@ -40,15 +42,21 @@ var (
 	upstreamAddr = flag.String("upstream-addr", "", "Address of the upstream Postgres server, in host:port format")
 	upstreamCA   = flag.String("upstream-ca-file", "", "File containing the PEM-encoded CA certificate for the upstream server")
 	tailscaleDir = flag.String("state-dir", "", "Directory in which to store the Tailscale auth state")
+	otelLogger   = otelslog.NewLogger("tailscale-pgproxy")
 )
 
 func main() {
+	shutdownOtel, err := setupOTelSDK(context.Background())
+
+	defer shutdownOtel(context.Background())
+
 	flag.Parse()
 	if *hostname == "" {
 		log.Fatal("missing --hostname")
 	}
 	if *upstreamAddr == "" {
 		log.Fatal("missing --upstream-addr")
+
 	}
 	if *upstreamCA == "" {
 		log.Fatal("missing --upstream-ca-file")
@@ -68,7 +76,7 @@ func main() {
 
 	tsclient, err := ts.LocalClient()
 	if err != nil {
-		log.Fatalf("getting tsnet API client: %v", err)
+		log.Fatal("getting tsnet API client: %v", err)
 	}
 
 	p, err := newProxy(*upstreamAddr, *upstreamCA, tsclient)
@@ -96,7 +104,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("serving access to %s on port %d", *upstreamAddr, *port)
+	otelLogger.Debug("serving access to %s on port %d", *upstreamAddr, *port)
 	log.Fatal(p.Serve(ln))
 }
 
@@ -178,7 +186,7 @@ func (p *proxy) Serve(ln net.Listener) error {
 		lastSessionID = id
 		go func(sessionID int64) {
 			if err := p.serve(sessionID, c); err != nil {
-				log.Printf("%d: session ended with error: %v", sessionID, err)
+				otelLogger.Error("%d: session ended with error: %v", sessionID, err)
 			}
 		}(id)
 	}
@@ -228,11 +236,11 @@ func (p *proxy) serve(sessionID int64, clientConn net.Conn) error {
 		p.errors.Add("no-ts-identity", 1)
 		return fmt.Errorf("couldn't identify source user and machine (user %q, machine %q)", tailscaleUser, machine)
 	}
-	log.Printf("%d: session start, from %s (machine %s, user %s)", sessionID, clientConn.RemoteAddr(), machine, tailscaleUser)
+	otelLogger.Debug("%d: session start, from %s (machine %s, user %s)", sessionID, clientConn.RemoteAddr(), machine, tailscaleUser)
 	start := time.Now()
 	defer func() {
 		elapsed := time.Since(start)
-		log.Printf("%d: session end, from %s (machine %s, user %s), lasted %s", sessionID, clientConn.RemoteAddr(), machine, tailscaleUser, elapsed.Round(time.Millisecond))
+		otelLogger.Debug("%d: session end, from %s (machine %s, user %s), lasted %s", sessionID, clientConn.RemoteAddr(), machine, tailscaleUser, elapsed.Round(time.Millisecond))
 	}()
 
 	// Read the client's opening message, to figure out if it's trying
@@ -246,10 +254,10 @@ func (p *proxy) serve(sessionID int64, clientConn net.Conn) error {
 	switch {
 	case buf == sslStart:
 		clientIsTLS = true
-		log.Print("TLS is enabled")
+		otelLogger.Debug("TLS is enabled")
 	case buf == plaintextStart:
 		clientIsTLS = false
-		log.Print("TLS is disabled")
+		otelLogger.Debug("TLS is disabled")
 	default:
 		p.errors.Add("client-bad-protocol", 1)
 		return fmt.Errorf("unrecognized initial packet = % 02x", buf)
@@ -287,7 +295,7 @@ func (p *proxy) serve(sessionID int64, clientConn net.Conn) error {
 		p.errors.Add("upstream-tls", 1)
 		return fmt.Errorf("upstream TLS handshake: %v", err)
 	}
-	log.Print("Upstream TLS handshake complete")
+	otelLogger.Debug("Upstream TLS handshake complete")
 
 	// This proxy acts as backend for the client connection
 	var backend *pgproto3.Backend
@@ -317,7 +325,7 @@ func (p *proxy) serve(sessionID int64, clientConn net.Conn) error {
 	// If the connecting Tailscale user is a GMail address, substitute credentials
 	// with fixed values regardless of what the client sends.
 	if strings.HasSuffix(tailscaleUser, "@gmail.com") {
-		log.Printf("Recognized user %s", tailscaleUser)
+		otelLogger.Debug("Recognized user %s", tailscaleUser)
 	} else {
 
 	}
@@ -327,7 +335,7 @@ func (p *proxy) serve(sessionID int64, clientConn net.Conn) error {
 		return fmt.Errorf("auth intercept for %s: %v", tailscaleUser, err)
 	}
 
-	log.Print("Started proxying data")
+	otelLogger.Debug("Started proxying data")
 
 	// Finally, proxy the client to the upstream.
 	errc := make(chan error, 1)
@@ -363,11 +371,11 @@ func logClientRequestAndProxy(sessionID int64, frontend *pgproto3.Frontend, back
 		}
 		switch m := msg.(type) {
 		case *pgproto3.Query:
-			log.Printf("%d: query: %s", sessionID, m.String)
+			otelLogger.Info("%d: query: %s", sessionID, m.String)
 		case *pgproto3.Parse:
-			log.Printf("%d: prepare: %s", sessionID, m.Query)
+			otelLogger.Info("%d: prepare: %s", sessionID, m.Query)
 		case *pgproto3.Terminate:
-			log.Print("Closing client session")
+			otelLogger.Debug("Closing client session")
 			terminated = true
 		}
 		frontend.Send(msg)
@@ -404,7 +412,7 @@ func (p *proxy) interceptAuth(frontend *pgproto3.Frontend, backend *pgproto3.Bac
 	if !ok {
 		return fmt.Errorf("unexpected startup message type: %T", startupMsg)
 	}
-	log.Printf("Received startup message of length with parameters %v", startup.Parameters)
+	otelLogger.Debug("Received startup message of length with parameters %v", startup.Parameters)
 
 	var postgresUser string
 	var postgresPass string
@@ -452,16 +460,16 @@ func handleUpstreamAuth(frontend *pgproto3.Frontend, username, password string) 
 	}
 	switch m := msg.(type) {
 	case *pgproto3.AuthenticationOk:
-		log.Print("Authentication successful")
+		otelLogger.Debug("Authentication successful")
 		return nil
 	case *pgproto3.AuthenticationCleartextPassword:
-		log.Print("Authentication with clear text password")
+		otelLogger.Debug("Authentication with clear text password")
 		frontend.Send(&pgproto3.PasswordMessage{Password: password})
 		if err := frontend.Flush(); err != nil {
 			return fmt.Errorf("sending cleartext password: %v", err)
 		}
 	case *pgproto3.AuthenticationMD5Password:
-		log.Print("Authentication with MD5 hashed password")
+		otelLogger.Debug("Authentication with MD5 hashed password")
 		inner := md5.Sum([]byte(password + username))
 		innerHex := fmt.Sprintf("%x", inner)
 		outer := md5.Sum(append([]byte(innerHex), m.Salt[:]...))

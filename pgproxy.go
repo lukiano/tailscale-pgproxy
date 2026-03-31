@@ -333,7 +333,7 @@ func (p *proxy) serve(sessionID int64, clientConn net.Conn) error {
 	errc := make(chan error, 1)
 	go func() {
 		// Proxy requests to the Postgres server, logging SQL statements.
-		err := logAndProxy(sessionID, frontend, backend)
+		err := logClientRequestAndProxy(sessionID, frontend, backend)
 		errc <- err
 	}()
 	go func() {
@@ -354,8 +354,9 @@ func (p *proxy) serve(sessionID int64, clientConn net.Conn) error {
 // logAndProxy reads PostgreSQL wire protocol messages from src, logs any SQL
 // statements ('Q' simple queries and 'P' prepared statements), and forwards
 // all messages verbatim to dst.
-func logAndProxy(sessionID int64, frontend *pgproto3.Frontend, backend *pgproto3.Backend) error {
-	for {
+func logClientRequestAndProxy(sessionID int64, frontend *pgproto3.Frontend, backend *pgproto3.Backend) error {
+	terminated := false
+	for terminated == false {
 		msg, err := backend.Receive()
 		if err != nil {
 			return err
@@ -365,12 +366,16 @@ func logAndProxy(sessionID int64, frontend *pgproto3.Frontend, backend *pgproto3
 			log.Printf("%d: query: %s", sessionID, m.String)
 		case *pgproto3.Parse:
 			log.Printf("%d: prepare: %s", sessionID, m.Query)
+		case *pgproto3.Terminate:
+			log.Print("Closing client session")
+			terminated = true
 		}
 		frontend.Send(msg)
 		if err = frontend.Flush(); err != nil {
 			return err
 		}
 	}
+	return nil
 }
 
 func proxyServerResponses(frontend *pgproto3.Frontend, backend *pgproto3.Backend) error {

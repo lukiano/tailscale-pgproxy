@@ -321,8 +321,8 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 	// Finally, proxy the client to the upstream.
 	errc := make(chan error, 1)
 	go func() {
-		// Proxy requests to the Postgres server.
-		_, err := io.Copy(upstreamTLSConn, clientConn)
+		// Proxy requests to the Postgres server, logging SQL statements.
+		err := logAndProxy(sessionID, upstreamTLSConn, clientConn)
 		errc <- err
 	}()
 	go func() {
@@ -338,6 +338,64 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 		return fmt.Errorf("session terminated with error: %v", err)
 	}
 	return nil
+}
+
+// logAndProxy reads PostgreSQL wire protocol messages from src, logs any SQL
+// statements ('Q' simple queries and 'P' prepared statements), and forwards
+// all messages verbatim to dst.
+// TODO Consider using a future-proof package that understands
+// the Postgres protocol like https://github.com/jackc/pgx/tree/master/pgproto3
+// instead of performing byte manipulation
+func logAndProxy(sessionID int64, dst io.Writer, src io.Reader) error {
+	var header [5]byte // 1 byte type + 4 bytes length
+	for {
+		if _, err := io.ReadFull(src, header[:]); err != nil {
+			return err
+		}
+		msgType := header[0]
+		rawLen := int(binary.BigEndian.Uint32(header[1:5]))
+		if rawLen < 4 {
+			return fmt.Errorf("invalid message length %d for type %q", rawLen, msgType)
+		}
+		payloadLen := rawLen - 4
+
+		if _, err := dst.Write(header[:]); err != nil {
+			return err
+		}
+		if payloadLen == 0 {
+			continue
+		}
+
+		switch msgType {
+		case 'Q': // Simple query — payload is a null-terminated SQL string.
+			payload := make([]byte, payloadLen)
+			if _, err := io.ReadFull(src, payload); err != nil {
+				return err
+			}
+			sql := string(bytes.TrimRight(payload, "\x00"))
+			log.Printf("%d: query: %s", sessionID, sql)
+			if _, err := dst.Write(payload); err != nil {
+				return err
+			}
+		case 'P': // Parse (prepared statement) — payload is: name\0 query\0 ...
+			payload := make([]byte, payloadLen)
+			if _, err := io.ReadFull(src, payload); err != nil {
+				return err
+			}
+			if _, rest, ok := bytes.Cut(payload, []byte{0}); ok {
+				if query, _, ok := bytes.Cut(rest, []byte{0}); ok {
+					log.Printf("%d: prepare: %s", sessionID, query)
+				}
+			}
+			if _, err := dst.Write(payload); err != nil {
+				return err
+			}
+		default:
+			if _, err := io.CopyN(dst, src, int64(payloadLen)); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 // interceptAuth reads the client's PostgreSQL startup message, rewrites the

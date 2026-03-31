@@ -210,7 +210,7 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 	}
 
 	// Before anything else, log the connection attempt.
-	user, machine := "", ""
+	tailscaleUser, machine := "", ""
 	if whois.Node != nil {
 		if whois.Node.Hostinfo.ShareeNode() {
 			machine = "external-device"
@@ -219,20 +219,20 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 		}
 	}
 	if whois.UserProfile != nil {
-		user = whois.UserProfile.LoginName
-		if user == "tagged-devices" && whois.Node != nil {
-			user = strings.Join(whois.Node.Tags, ",")
+		tailscaleUser = whois.UserProfile.LoginName
+		if tailscaleUser == "tagged-devices" && whois.Node != nil {
+			tailscaleUser = strings.Join(whois.Node.Tags, ",")
 		}
 	}
-	if user == "" || machine == "" {
+	if tailscaleUser == "" || machine == "" {
 		p.errors.Add("no-ts-identity", 1)
-		return fmt.Errorf("couldn't identify source user and machine (user %q, machine %q)", user, machine)
+		return fmt.Errorf("couldn't identify source user and machine (user %q, machine %q)", tailscaleUser, machine)
 	}
-	log.Printf("%d: session start, from %s (machine %s, user %s)", sessionID, c.RemoteAddr(), machine, user)
+	log.Printf("%d: session start, from %s (machine %s, user %s)", sessionID, c.RemoteAddr(), machine, tailscaleUser)
 	start := time.Now()
 	defer func() {
 		elapsed := time.Since(start)
-		log.Printf("%d: session end, from %s (machine %s, user %s), lasted %s", sessionID, c.RemoteAddr(), machine, user, elapsed.Round(time.Millisecond))
+		log.Printf("%d: session end, from %s (machine %s, user %s), lasted %s", sessionID, c.RemoteAddr(), machine, tailscaleUser, elapsed.Round(time.Millisecond))
 	}()
 
 	// Read the client's opening message, to figure out if it's trying
@@ -256,17 +256,17 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 	// Dial & verify upstream connection.
 	var d net.Dialer
 	d.Timeout = 10 * time.Second
-	upc, err := d.Dial("tcp", p.upstreamAddr)
+	upstreamConn, err := d.Dial("tcp", p.upstreamAddr)
 	if err != nil {
 		p.errors.Add("network-error", 1)
 		return fmt.Errorf("upstream dial: %v", err)
 	}
-	defer upc.Close()
-	if _, err := upc.Write(sslStart[:]); err != nil {
+	defer upstreamConn.Close()
+	if _, err := upstreamConn.Write(sslStart[:]); err != nil {
 		p.errors.Add("network-error", 1)
 		return fmt.Errorf("upstream write of start-ssl magic: %v", err)
 	}
-	if _, err := io.ReadFull(upc, buf[:1]); err != nil {
+	if _, err := io.ReadFull(upstreamConn, buf[:1]); err != nil {
 		p.errors.Add("network-error", 1)
 		return fmt.Errorf("reading upstream start-ssl response: %v", err)
 	}
@@ -279,8 +279,8 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 		RootCAs:    p.upstreamCertPool,
 		MinVersion: tls.VersionTLS12,
 	}
-	uptc := tls.Client(upc, tlsConf)
-	if err = uptc.HandshakeContext(ctx); err != nil {
+	upstreamTLSConn := tls.Client(upstreamConn, tlsConf)
+	if err = upstreamTLSConn.HandshakeContext(ctx); err != nil {
 		p.errors.Add("upstream-tls", 1)
 		return fmt.Errorf("upstream TLS handshake: %v", err)
 	}
@@ -294,7 +294,7 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 			Certificates: p.downstreamCert,
 			MinVersion:   tls.VersionTLS12,
 		})
-		if err = uptc.HandshakeContext(ctx); err != nil {
+		if err = upstreamTLSConn.HandshakeContext(ctx); err != nil {
 			p.errors.Add("client-tls", 1)
 			return fmt.Errorf("client TLS handshake: %v", err)
 		}
@@ -303,16 +303,16 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 		clientConn = c
 	}
 
-	// If the connecting Tailscale user is lleggieri@gmail.com, substitute fixed
-	// credentials ("ro" / "my-secret") regardless of what the client sends.
-	if user == "lleggieri@gmail.com" {
-		if err := p.interceptAuth(clientConn, uptc, clientIsTLS, user); err != nil {
+	// If the connecting Tailscale user is a GMail address, substitute credentials
+	// with fixed values regardless of what the client sends.
+	if strings.HasSuffix(tailscaleUser, "@gmail.com") {
+		if err := p.interceptAuth(clientConn, upstreamTLSConn, clientIsTLS, tailscaleUser); err != nil {
 			p.errors.Add("auth-intercept", 1)
-			return fmt.Errorf("auth intercept for %s: %v", user, err)
+			return fmt.Errorf("auth intercept for %s: %v", tailscaleUser, err)
 		}
 	} else if !clientIsTLS {
 		// For non-intercepted plaintext sessions, forward the startup header we already read.
-		if _, err := uptc.Write(plaintextStart[:]); err != nil {
+		if _, err := upstreamTLSConn.Write(plaintextStart[:]); err != nil {
 			p.errors.Add("network-error", 1)
 			return fmt.Errorf("sending initial client bytes to upstream: %v", err)
 		}
@@ -321,11 +321,13 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 	// Finally, proxy the client to the upstream.
 	errc := make(chan error, 1)
 	go func() {
-		_, err := io.Copy(uptc, clientConn)
+		// Proxy requests to the Postgres server.
+		_, err := io.Copy(upstreamTLSConn, clientConn)
 		errc <- err
 	}()
 	go func() {
-		_, err := io.Copy(clientConn, uptc)
+		// Proxy responses back to the client.
+		_, err := io.Copy(clientConn, upstreamTLSConn)
 		errc <- err
 	}()
 	if err := <-errc; err != nil {
@@ -341,7 +343,7 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 // interceptAuth reads the client's PostgreSQL startup message, rewrites the
 // user field to "ro", forwards it to upstream, handles the upstream auth
 // challenge using the injected password, then sends AuthOk to the client.
-func (p *proxy) interceptAuth(clientConn net.Conn, upstream net.Conn, clientIsTLS bool, user string) error {
+func (p *proxy) interceptAuth(clientConn net.Conn, upstream net.Conn, clientIsTLS bool, tailscaleUser string) error {
 	var startupMsg []byte
 	if clientIsTLS {
 		// After TLS handshake the client sends a fresh startup message.
@@ -373,14 +375,20 @@ func (p *proxy) interceptAuth(clientConn net.Conn, upstream net.Conn, clientIsTL
 		}
 	}
 
-	newStartup, err := rewriteStartupUser(startupMsg, "ro", user)
+	newStartup, err := rewriteStartupUser(startupMsg, "ro", tailscaleUser)
 	if err != nil {
 		return fmt.Errorf("rewriting startup: %v", err)
 	}
 	if _, err := upstream.Write(newStartup); err != nil {
 		return fmt.Errorf("sending startup to upstream: %v", err)
 	}
-	if err := handleUpstreamAuth(upstream, "ro", "my-secret"); err != nil {
+	postgresUser := "ro"
+	postgresPass := "my-secret"
+	if tailscaleUser == "foo" { // Here we can check which users have read/write permissions
+		postgresUser = "rw"
+		postgresPass = "do-not-share"
+	}
+	if err := handleUpstreamAuth(upstream, postgresUser, postgresPass); err != nil {
 		return fmt.Errorf("upstream auth: %v", err)
 	}
 
@@ -395,7 +403,7 @@ func (p *proxy) interceptAuth(clientConn net.Conn, upstream net.Conn, clientIsTL
 
 // rewriteStartupUser returns a copy of the PostgreSQL startup message with the
 // "user" parameter replaced by postgresUser. All other parameters are preserved.
-func rewriteStartupUser(msg []byte, postgresUser string, user string) ([]byte, error) {
+func rewriteStartupUser(msg []byte, postgresUser string, tailscaleUser string) ([]byte, error) {
 	if len(msg) < 8 {
 		return nil, fmt.Errorf("startup message too short (%d bytes)", len(msg))
 	}
@@ -431,10 +439,10 @@ func rewriteStartupUser(msg []byte, postgresUser string, user string) ([]byte, e
 
 	// Append user to application name
 	if _, exists := params["application_name"]; exists {
-		params["application_name"] = params["application_name"] + " - " + user
+		params["application_name"] = params["application_name"] + " - " + tailscaleUser
 	} else {
 		keys = append(keys, "application_name")
-		params["application_name"] = user
+		params["application_name"] = tailscaleUser
 
 	}
 

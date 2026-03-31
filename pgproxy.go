@@ -26,7 +26,7 @@ import (
 	"strings"
 	"time"
 
-	pgproto3 "github.com/jackc/pgproto3/v2"
+	pgproto3 "github.com/jackc/pgx/v5/pgproto3"
 	"tailscale.com/client/local"
 	"tailscale.com/metrics"
 	"tailscale.com/tsnet"
@@ -304,15 +304,15 @@ func (p *proxy) serve(sessionID int64, clientConn net.Conn) error {
 			p.errors.Add("client-tls", 1)
 			return fmt.Errorf("client TLS handshake: %v", err)
 		}
-		backend = pgproto3.NewBackend(pgproto3.NewChunkReader(secureClientConn), secureClientConn)
+		backend = pgproto3.NewBackend(secureClientConn, secureClientConn)
 	} else {
 		// For non-TLS connections the first 8 bytes were already consumed; prepend them.
 		clientReader := io.MultiReader(bytes.NewReader(plaintextStart[:]), clientConn)
-		backend = pgproto3.NewBackend(pgproto3.NewChunkReader(clientReader), clientConn)
+		backend = pgproto3.NewBackend(clientReader, clientConn)
 	}
 
 	// This proxy acts as frontend to the upstream database server
-	frontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(upstreamTLSConn), upstreamTLSConn)
+	frontend := pgproto3.NewFrontend(upstreamTLSConn, upstreamTLSConn)
 
 	// If the connecting Tailscale user is a GMail address, substitute credentials
 	// with fixed values regardless of what the client sends.
@@ -366,7 +366,8 @@ func logAndProxy(sessionID int64, frontend *pgproto3.Frontend, backend *pgproto3
 		case *pgproto3.Parse:
 			log.Printf("%d: prepare: %s", sessionID, m.Query)
 		}
-		if err := frontend.Send(msg); err != nil {
+		frontend.Send(msg)
+		if err = frontend.Flush(); err != nil {
 			return err
 		}
 	}
@@ -378,7 +379,8 @@ func proxyServerResponses(frontend *pgproto3.Frontend, backend *pgproto3.Backend
 		if err != nil {
 			return err
 		}
-		if err := backend.Send(msg); err != nil {
+		backend.Send(msg)
+		if err := backend.Flush(); err != nil {
 			return err
 		}
 	}
@@ -420,7 +422,8 @@ func (p *proxy) interceptAuth(frontend *pgproto3.Frontend, backend *pgproto3.Bac
 		}
 	}
 
-	if err := frontend.Send(startup); err != nil {
+	frontend.Send(startup)
+	if err := frontend.Flush(); err != nil {
 		return fmt.Errorf("sending startup to upstream: %v", err)
 	}
 
@@ -428,7 +431,8 @@ func (p *proxy) interceptAuth(frontend *pgproto3.Frontend, backend *pgproto3.Bac
 		return fmt.Errorf("upstream auth: %v", err)
 	}
 
-	if err := backend.Send(&pgproto3.AuthenticationOk{}); err != nil {
+	backend.Send(&pgproto3.AuthenticationOk{})
+	if err := backend.Flush(); err != nil {
 		return fmt.Errorf("sending auth ok to client: %v", err)
 	}
 	return nil
@@ -447,7 +451,8 @@ func handleUpstreamAuth(frontend *pgproto3.Frontend, username, password string) 
 		return nil
 	case *pgproto3.AuthenticationCleartextPassword:
 		log.Print("Authentication with clear text password")
-		if err := frontend.Send(&pgproto3.PasswordMessage{Password: password}); err != nil {
+		frontend.Send(&pgproto3.PasswordMessage{Password: password})
+		if err := frontend.Flush(); err != nil {
 			return fmt.Errorf("sending cleartext password: %v", err)
 		}
 	case *pgproto3.AuthenticationMD5Password:
@@ -456,7 +461,8 @@ func handleUpstreamAuth(frontend *pgproto3.Frontend, username, password string) 
 		innerHex := fmt.Sprintf("%x", inner)
 		outer := md5.Sum(append([]byte(innerHex), m.Salt[:]...))
 		hashed := "md5" + fmt.Sprintf("%x", outer)
-		if err := frontend.Send(&pgproto3.PasswordMessage{Password: hashed}); err != nil {
+		frontend.Send(&pgproto3.PasswordMessage{Password: hashed})
+		if err := frontend.Flush(); err != nil {
 			return fmt.Errorf("sending MD5 password: %v", err)
 		}
 	default:

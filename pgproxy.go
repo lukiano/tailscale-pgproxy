@@ -5,13 +5,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/md5"
 	crand "crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"expvar"
 	"flag"
 	"fmt"
@@ -297,15 +300,23 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 		}
 		clientConn = s
 	} else {
-		// Repeat the header we read earlier up to the server.
+		clientConn = c
+	}
+
+	// If the connecting Tailscale user is lleggieri@gmail.com, substitute fixed
+	// credentials ("ro" / "my-secret") regardless of what the client sends.
+	if user == "lleggieri@gmail.com" {
+		if err := p.interceptAuth(clientConn, uptc, clientIsTLS, user); err != nil {
+			p.errors.Add("auth-intercept", 1)
+			return fmt.Errorf("auth intercept for %s: %v", user, err)
+		}
+	} else if !clientIsTLS {
+		// For non-intercepted plaintext sessions, forward the startup header we already read.
 		if _, err := uptc.Write(plaintextStart[:]); err != nil {
 			p.errors.Add("network-error", 1)
 			return fmt.Errorf("sending initial client bytes to upstream: %v", err)
 		}
-		clientConn = c
 	}
-
-	// TODO If user is lleggieri@gmail.com, then I want the PostgreSQL session to be logged in with user "ro" and password "my-secret", disregarding incoming values.
 
 	// Finally, proxy the client to the upstream.
 	errc := make(chan error, 1)
@@ -323,6 +334,206 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 		// connection normally, and it'll obscure "interesting"
 		// handshake errors.
 		return fmt.Errorf("session terminated with error: %v", err)
+	}
+	return nil
+}
+
+// interceptAuth reads the client's PostgreSQL startup message, rewrites the
+// user field to "ro", forwards it to upstream, handles the upstream auth
+// challenge using the injected password, then sends AuthOk to the client.
+func (p *proxy) interceptAuth(clientConn net.Conn, upstream net.Conn, clientIsTLS bool, user string) error {
+	var startupMsg []byte
+	if clientIsTLS {
+		// After TLS handshake the client sends a fresh startup message.
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(clientConn, lenBuf[:]); err != nil {
+			return fmt.Errorf("reading startup length: %v", err)
+		}
+		msgLen := int(binary.BigEndian.Uint32(lenBuf[:]))
+		if msgLen < 8 || msgLen > 65536 {
+			return fmt.Errorf("invalid startup message length: %d", msgLen)
+		}
+		startupMsg = make([]byte, msgLen)
+		copy(startupMsg, lenBuf[:])
+		if _, err := io.ReadFull(clientConn, startupMsg[4:]); err != nil {
+			return fmt.Errorf("reading startup message: %v", err)
+		}
+	} else {
+		// We already read the first 8 bytes (plaintextStart); read the rest.
+		totalLen := int(binary.BigEndian.Uint32(plaintextStart[:4]))
+		if totalLen < 8 || totalLen > 65536 {
+			return fmt.Errorf("invalid startup message length: %d", totalLen)
+		}
+		startupMsg = make([]byte, totalLen)
+		copy(startupMsg, plaintextStart[:])
+		if totalLen > 8 {
+			if _, err := io.ReadFull(clientConn, startupMsg[8:]); err != nil {
+				return fmt.Errorf("reading startup message remainder: %v", err)
+			}
+		}
+	}
+
+	newStartup, err := rewriteStartupUser(startupMsg, "ro", user)
+	if err != nil {
+		return fmt.Errorf("rewriting startup: %v", err)
+	}
+	if _, err := upstream.Write(newStartup); err != nil {
+		return fmt.Errorf("sending startup to upstream: %v", err)
+	}
+	if err := handleUpstreamAuth(upstream, "ro", "my-secret"); err != nil {
+		return fmt.Errorf("upstream auth: %v", err)
+	}
+
+	// Tell the client auth succeeded.
+	// PostgreSQL AuthenticationOk: 'R' + int32(8) + int32(0)
+	authOk := []byte{'R', 0, 0, 0, 8, 0, 0, 0, 0}
+	if _, err := clientConn.Write(authOk); err != nil {
+		return fmt.Errorf("sending auth ok to client: %v", err)
+	}
+	return nil
+}
+
+// rewriteStartupUser returns a copy of the PostgreSQL startup message with the
+// "user" parameter replaced by postgresUser. All other parameters are preserved.
+func rewriteStartupUser(msg []byte, postgresUser string, user string) ([]byte, error) {
+	if len(msg) < 8 {
+		return nil, fmt.Errorf("startup message too short (%d bytes)", len(msg))
+	}
+	// msg[0:4] = total length; msg[4:8] = protocol version (preserved)
+	protocol := msg[4:8]
+
+	params := make(map[string]string)
+	keys := make([]string, 0)
+	rest := msg[8:]
+	for len(rest) > 0 && rest[0] != 0 {
+		end := bytes.IndexByte(rest, 0)
+		if end < 0 {
+			return nil, fmt.Errorf("malformed startup message: unterminated key")
+		}
+		key := string(rest[:end])
+		rest = rest[end+1:]
+		end = bytes.IndexByte(rest, 0)
+		if end < 0 {
+			return nil, fmt.Errorf("malformed startup message: unterminated value for %q", key)
+		}
+		val := string(rest[:end])
+		rest = rest[end+1:]
+		if _, exists := params[key]; !exists {
+			keys = append(keys, key)
+		}
+		params[key] = val
+	}
+
+	if _, exists := params["user"]; !exists {
+		keys = append(keys, "user")
+	}
+	params["user"] = postgresUser
+
+	// Append user to application name
+	if _, exists := params["application_name"]; exists {
+		params["application_name"] = params["application_name"] + " - " + user
+	} else {
+		keys = append(keys, "application_name")
+		params["application_name"] = user
+
+	}
+
+	var body []byte
+	body = append(body, protocol...)
+	for _, k := range keys {
+		body = append(body, k...)
+		body = append(body, 0)
+		body = append(body, params[k]...)
+		body = append(body, 0)
+	}
+	body = append(body, 0) // message terminator
+
+	newMsg := make([]byte, 4+len(body))
+	binary.BigEndian.PutUint32(newMsg[:4], uint32(len(newMsg)))
+	copy(newMsg[4:], body)
+	return newMsg, nil
+}
+
+// handleUpstreamAuth handles the PostgreSQL authentication exchange, responding
+// to the upstream's challenge with the given credentials. Returns nil on AuthOk.
+func handleUpstreamAuth(upstream net.Conn, username, password string) error {
+	var typeBuf [1]byte
+	var lenBuf [4]byte
+
+	if _, err := io.ReadFull(upstream, typeBuf[:]); err != nil {
+		return fmt.Errorf("reading auth message type: %v", err)
+	}
+	if typeBuf[0] != 'R' {
+		return fmt.Errorf("expected auth message ('R'), got %q", typeBuf[0])
+	}
+	if _, err := io.ReadFull(upstream, lenBuf[:]); err != nil {
+		return fmt.Errorf("reading auth message length: %v", err)
+	}
+	bodyLen := int(binary.BigEndian.Uint32(lenBuf[:])) - 4
+	if bodyLen < 4 {
+		return fmt.Errorf("auth message body too short")
+	}
+	body := make([]byte, bodyLen)
+	if _, err := io.ReadFull(upstream, body); err != nil {
+		return fmt.Errorf("reading auth message body: %v", err)
+	}
+
+	authType := binary.BigEndian.Uint32(body[:4])
+	switch authType {
+	case 0:
+		return nil // AuthenticationOk — no password needed
+	case 3:
+		// AuthenticationCleartextPassword
+		pw := append([]byte(password), 0)
+		msg := make([]byte, 5+len(pw))
+		msg[0] = 'p'
+		binary.BigEndian.PutUint32(msg[1:5], uint32(4+len(pw)))
+		copy(msg[5:], pw)
+		if _, err := upstream.Write(msg); err != nil {
+			return fmt.Errorf("sending cleartext password: %v", err)
+		}
+	case 5:
+		// AuthenticationMD5Password — salt is body[4:8]
+		if len(body) < 8 {
+			return fmt.Errorf("MD5 auth message too short")
+		}
+		salt := body[4:8]
+		inner := md5.Sum([]byte(password + username))
+		innerHex := fmt.Sprintf("%x", inner)
+		outer := md5.Sum(append([]byte(innerHex), salt...))
+		hashed := "md5" + fmt.Sprintf("%x", outer)
+		pw := append([]byte(hashed), 0)
+		msg := make([]byte, 5+len(pw))
+		msg[0] = 'p'
+		binary.BigEndian.PutUint32(msg[1:5], uint32(4+len(pw)))
+		copy(msg[5:], pw)
+		if _, err := upstream.Write(msg); err != nil {
+			return fmt.Errorf("sending MD5 password: %v", err)
+		}
+	default:
+		return fmt.Errorf("unsupported authentication method: %d", authType)
+	}
+
+	// Read auth result after sending password.
+	if _, err := io.ReadFull(upstream, typeBuf[:]); err != nil {
+		return fmt.Errorf("reading auth result type: %v", err)
+	}
+	if typeBuf[0] != 'R' {
+		return fmt.Errorf("expected auth result ('R'), got %q", typeBuf[0])
+	}
+	if _, err := io.ReadFull(upstream, lenBuf[:]); err != nil {
+		return fmt.Errorf("reading auth result length: %v", err)
+	}
+	resultBodyLen := int(binary.BigEndian.Uint32(lenBuf[:])) - 4
+	if resultBodyLen < 4 {
+		return fmt.Errorf("auth result body too short")
+	}
+	result := make([]byte, resultBodyLen)
+	if _, err := io.ReadFull(upstream, result); err != nil {
+		return fmt.Errorf("reading auth result: %v", err)
+	}
+	if binary.BigEndian.Uint32(result[:4]) != 0 {
+		return fmt.Errorf("authentication failed")
 	}
 	return nil
 }

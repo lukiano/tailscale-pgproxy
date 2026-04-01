@@ -38,13 +38,12 @@ import (
 )
 
 var (
-	hostname     = flag.String("hostname", "", "Tailscale hostname to serve on")
 	port         = flag.Int("port", 5432, "Listening port for client connections")
 	debugPort    = flag.Int("debug-port", 80, "Listening port for debug/metrics endpoint")
 	upstreamAddr = flag.String("upstream-addr", "", "Address of the upstream Postgres server, in host:port format")
 	upstreamCA   = flag.String("upstream-ca-file", "", "File containing the PEM-encoded CA certificate for the upstream server")
 	tailscaleDir = flag.String("state-dir", "", "Directory in which to store the Tailscale auth state")
-	otelLogger   = otelslog.NewLogger("tailscale-pgproxy")
+	otelLogger   = otelslog.NewLogger("pgproxy")
 )
 
 func main() {
@@ -53,9 +52,6 @@ func main() {
 	defer shutdownOtel(context.Background())
 
 	flag.Parse()
-	if *hostname == "" {
-		log.Fatal("missing --hostname")
-	}
 	if *upstreamAddr == "" {
 		log.Fatal("missing --upstream-addr")
 
@@ -74,9 +70,10 @@ func main() {
 	authkey := strings.TrimSpace(string(authkeyBytes))
 
 	ts := &tsnet.Server{
-		Dir:      *tailscaleDir,
-		Hostname: *hostname,
-		AuthKey:  authkey,
+		Dir:           *tailscaleDir,
+		Hostname:      "pgproxy",
+		AuthKey:       authkey,
+		AdvertiseTags: []string{"tag:database-service"},
 	}
 
 	// if os.Getenv("TS_AUTHKEY") == "" {
@@ -85,22 +82,18 @@ func main() {
 
 	tsclient, err := ts.LocalClient()
 	if err != nil {
-		log.Fatal("getting tsnet API client: %v", err)
+		log.Fatalf("getting tsnet API client: %v", err)
 	}
 
 	// Retrieve the tailscale domain (e.g. "tailb8de41.ts.net") from the
 	// local client's network status so we can build the setec server URL.
-	log.Print("1")
-	tsStatus, err := tsclient.StatusWithoutPeers(context.Background())
+	tsStatus, err := ts.Up(context.Background())
 	if err != nil {
 		log.Fatalf("getting tailscale status: %v", err)
 	}
-	log.Print("2")
-	tsStatus, err = tsclient.StatusWithoutPeers(context.Background())
 	if tsStatus.CurrentTailnet == nil {
 		log.Fatal("not connected to a tailnet")
 	}
-	log.Print("3")
 	tailScaleDomain := tsStatus.CurrentTailnet.MagicDNSSuffix
 
 	// TODO check if we should use setecClient.Store
@@ -131,7 +124,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	otelLogger.Debug("serving access to %s on port %d", *upstreamAddr, *port)
+	otelLogger.Debug(fmt.Sprintf("serving access to %s on port %d", *upstreamAddr, *port))
 	log.Fatal(p.Serve(ln))
 }
 
@@ -215,7 +208,7 @@ func (p *proxy) Serve(ln net.Listener) error {
 		lastSessionID = id
 		go func(sessionID int64) {
 			if err := p.serve(sessionID, c); err != nil {
-				otelLogger.Error("%d: session ended with error: %v", sessionID, err)
+				otelLogger.Error(fmt.Sprintf("%d: session ended with error: %v", sessionID, err))
 			}
 		}(id)
 	}
@@ -229,7 +222,8 @@ var (
 	// plaintextStart is the magic bytes that postgres clients use to
 	// indicate that they're starting a plaintext authentication
 	// handshake.
-	plaintextStart = [8]byte{0, 0, 0, 86, 0, 3, 0, 0}
+	plaintextStart  = [8]byte{0, 0, 0, 86, 0, 3, 0, 0}
+	plaintextSuffix = [4]byte{0, 3, 0, 0}
 )
 
 // serve proxies the postgres client on c to the proxy's upstream,
@@ -265,11 +259,11 @@ func (p *proxy) serve(sessionID int64, clientConn net.Conn) error {
 		p.errors.Add("no-ts-identity", 1)
 		return fmt.Errorf("couldn't identify source user and machine (user %q, machine %q)", tailscaleUser, machine)
 	}
-	otelLogger.Debug("%d: session start, from %s (machine %s, user %s)", sessionID, clientConn.RemoteAddr(), machine, tailscaleUser)
+	otelLogger.Debug(fmt.Sprintf("%d: session start, from %s (machine %s, user %s)", sessionID, clientConn.RemoteAddr(), machine, tailscaleUser))
 	start := time.Now()
 	defer func() {
 		elapsed := time.Since(start)
-		otelLogger.Debug("%d: session end, from %s (machine %s, user %s), lasted %s", sessionID, clientConn.RemoteAddr(), machine, tailscaleUser, elapsed.Round(time.Millisecond))
+		otelLogger.Debug(fmt.Sprintf("%d: session end, from %s (machine %s, user %s), lasted %s", sessionID, clientConn.RemoteAddr(), machine, tailscaleUser, elapsed.Round(time.Millisecond)))
 	}()
 
 	// Read the client's opening message, to figure out if it's trying
@@ -284,7 +278,7 @@ func (p *proxy) serve(sessionID int64, clientConn net.Conn) error {
 	case buf == sslStart:
 		clientIsTLS = true
 		otelLogger.Debug("TLS is enabled")
-	case buf == plaintextStart:
+	case bytes.HasSuffix(buf[:], plaintextSuffix[:]):
 		clientIsTLS = false
 		otelLogger.Debug("TLS is disabled")
 	default:
@@ -344,7 +338,7 @@ func (p *proxy) serve(sessionID int64, clientConn net.Conn) error {
 		backend = pgproto3.NewBackend(secureClientConn, secureClientConn)
 	} else {
 		// For non-TLS connections the first 8 bytes were already consumed; prepend them.
-		clientReader := io.MultiReader(bytes.NewReader(plaintextStart[:]), clientConn)
+		clientReader := io.MultiReader(bytes.NewReader(buf[:]), clientConn)
 		backend = pgproto3.NewBackend(clientReader, clientConn)
 	}
 
@@ -354,11 +348,9 @@ func (p *proxy) serve(sessionID int64, clientConn net.Conn) error {
 	// If the connecting Tailscale user is a GMail address, substitute credentials
 	// with fixed values regardless of what the client sends.
 	if strings.HasSuffix(tailscaleUser, "@gmail.com") {
-		otelLogger.Debug("Recognized user %s", tailscaleUser)
-	} else {
-
+		otelLogger.Debug(fmt.Sprintf("Recognized user %s", tailscaleUser), "User", tailscaleUser)
 	}
-	err = p.interceptAuth(frontend, backend, tailscaleUser)
+	err = p.interceptAuth(context.Background(), frontend, backend, tailscaleUser)
 	if err != nil {
 		p.errors.Add("auth-intercept", 1)
 		return fmt.Errorf("auth intercept for %s: %v", tailscaleUser, err)
@@ -400,9 +392,9 @@ func logClientRequestAndProxy(sessionID int64, frontend *pgproto3.Frontend, back
 		}
 		switch m := msg.(type) {
 		case *pgproto3.Query:
-			otelLogger.Info("%d: query: %s", sessionID, m.String)
+			otelLogger.Info(fmt.Sprintf("%d: query: %s", sessionID, m.String))
 		case *pgproto3.Parse:
-			otelLogger.Info("%d: prepare: %s", sessionID, m.Query)
+			otelLogger.Info(fmt.Sprintf("%d: prepare: %s", sessionID, m.Query))
 		case *pgproto3.Terminate:
 			otelLogger.Debug("Closing client session")
 			terminated = true
@@ -431,7 +423,7 @@ func proxyServerResponses(frontend *pgproto3.Frontend, backend *pgproto3.Backend
 // interceptAuth reads the client's PostgreSQL startup message, rewrites the
 // user field, forwards it to upstream, handles the upstream auth challenge
 // using the injected password, then sends AuthOk to the client.
-func (p *proxy) interceptAuth(frontend *pgproto3.Frontend, backend *pgproto3.Backend, tailscaleUser string) error {
+func (p *proxy) interceptAuth(ctx context.Context, frontend *pgproto3.Frontend, backend *pgproto3.Backend, tailscaleUser string) error {
 	startupMsg, err := backend.ReceiveStartupMessage()
 
 	if err != nil {
@@ -441,7 +433,7 @@ func (p *proxy) interceptAuth(frontend *pgproto3.Frontend, backend *pgproto3.Bac
 	if !ok {
 		return fmt.Errorf("unexpected startup message type: %T", startupMsg)
 	}
-	otelLogger.Debug("Received startup message of length with parameters %v", startup.Parameters)
+	otelLogger.Debug(fmt.Sprintf("Received startup message of length with parameters %v", startup.Parameters))
 
 	var postgresUser string
 	var postgresPass string
@@ -449,24 +441,55 @@ func (p *proxy) interceptAuth(frontend *pgproto3.Frontend, backend *pgproto3.Bac
 		postgresUser = startup.Parameters["user"]
 		postgresPass = startup.Parameters["password"]
 	} else {
-		roUser, err := p.secretsClient.Get(context.Background(), "prod/db/ro-user")
+		secrets, err := p.secretsClient.List(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to check group membership: %v", err)
+		}
+		isPowerUser := false
+		isRegularUser := false
+		userKey := "prod/db/ro-user"
+		passKey := "prod/db/ro-pass"
+		for _, secret := range secrets {
+			switch secret.Name {
+			case "prod/db/rw-pass":
+				isPowerUser = true
+			case "prod/db/ro-pass":
+				isRegularUser = true
+			}
+		}
+
+		if isPowerUser {
+			// Retrieve Read-Write credentials from the secrets manager
+			userKey = "prod/db/rw-user"
+			passKey = "prod/db/rw-pass"
+
+		} else if !isRegularUser {
+			// gracefully return an error message to the SQL client.
+			backend.Send(&pgproto3.ErrorResponse{Message: "Unauthorized"})
+			if err := backend.Flush(); err != nil {
+				return fmt.Errorf("failed to send error to client: %v", err)
+			}
+			return fmt.Errorf("User is not a member of database users group")
+		}
+		user, err := p.secretsClient.Get(ctx, userKey)
+		if err != nil {
+			// gracefully return an error message to the SQL client.
+			backend.Send(&pgproto3.ErrorResponse{Message: "Unable to get credentials"})
+			if err := backend.Flush(); err != nil {
+				return fmt.Errorf("failed to send error to client: %v", err)
+			}
+			return fmt.Errorf("failed to get secret: %v", err)
+		}
+		postgresUser = string(user.Value)
+
+		pass, err := p.secretsClient.Get(ctx, passKey)
 		if err != nil {
 			return fmt.Errorf("failed to get secret: %v", err)
 		}
-		postgresUser = string(roUser.Value)
-
-		roPass, err := p.secretsClient.Get(context.Background(), "prod/db/ro-pass")
-		if err != nil {
-			return fmt.Errorf("failed to get secret: %v", err)
-		}
-		postgresPass = string(roPass.Value)
-
-		if tailscaleUser == "foo" { // Here we can check which users have read/write permissions
-			postgresUser = "rw"
-			postgresPass = "do-not-share"
-		}
+		postgresPass = string(pass.Value)
 
 		startup.Parameters["user"] = postgresUser
+		startup.Parameters["database"] = "lleggieri" // TODO database name could be a secret
 		if appName, exists := startup.Parameters["application_name"]; exists {
 			startup.Parameters["application_name"] = appName + " - " + tailscaleUser
 		} else {

@@ -1,1 +1,1 @@
-go run . --hostname pgproxy --upstream-addr localhost:5432 --upstream-ca-file pg.crt --state-dir .
+go run . --upstream-addr localhost:5432 --upstream-ca-file server.crt --state-dir .

@@ -32,6 +32,8 @@ import (
 	"tailscale.com/tsnet"
 	"tailscale.com/tsweb"
 
+	setecClient "github.com/tailscale/setec/client/setec"
+
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 )
 
@@ -65,21 +67,46 @@ func main() {
 		log.Fatal("missing --state-dir")
 	}
 
+	authkeyBytes, err := os.ReadFile("tsauthkey")
+	if err != nil && !os.IsNotExist(err) {
+		log.Fatalf("reading tsauthkey: %v", err)
+	}
+	authkey := strings.TrimSpace(string(authkeyBytes))
+
 	ts := &tsnet.Server{
 		Dir:      *tailscaleDir,
 		Hostname: *hostname,
+		AuthKey:  authkey,
 	}
 
-	if os.Getenv("TS_AUTHKEY") == "" {
-		log.Print("Note: you need to run this with TS_AUTHKEY=... the first time, to join your tailnet of choice.")
-	}
+	// if os.Getenv("TS_AUTHKEY") == "" {
+	// 	log.Print("Note: you need to run this with TS_AUTHKEY=... the first time, to join your tailnet of choice.")
+	// }
 
 	tsclient, err := ts.LocalClient()
 	if err != nil {
 		log.Fatal("getting tsnet API client: %v", err)
 	}
 
-	p, err := newProxy(*upstreamAddr, *upstreamCA, tsclient)
+	// Retrieve the tailscale domain (e.g. "tailb8de41.ts.net") from the
+	// local client's network status so we can build the setec server URL.
+	log.Print("1")
+	tsStatus, err := tsclient.StatusWithoutPeers(context.Background())
+	if err != nil {
+		log.Fatalf("getting tailscale status: %v", err)
+	}
+	log.Print("2")
+	tsStatus, err = tsclient.StatusWithoutPeers(context.Background())
+	if tsStatus.CurrentTailnet == nil {
+		log.Fatal("not connected to a tailnet")
+	}
+	log.Print("3")
+	tailScaleDomain := tsStatus.CurrentTailnet.MagicDNSSuffix
+
+	// TODO check if we should use setecClient.Store
+	var secretClient = setecClient.Client{Server: "https://secrets." + tailScaleDomain}
+
+	p, err := newProxy(*upstreamAddr, *upstreamCA, tsclient, &secretClient)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -117,6 +144,7 @@ type proxy struct {
 	upstreamCertPool *x509.CertPool
 	downstreamCert   []tls.Certificate
 	client           *local.Client
+	secretsClient    *setecClient.Client
 
 	activeSessions  expvar.Int
 	startedSessions expvar.Int
@@ -126,7 +154,7 @@ type proxy struct {
 // newProxy returns a proxy that forwards connections to
 // upstreamAddr. The upstream's TLS session is verified using the CA
 // cert(s) in upstreamCAPath.
-func newProxy(upstreamAddr, upstreamCAPath string, client *local.Client) (*proxy, error) {
+func newProxy(upstreamAddr, upstreamCAPath string, client *local.Client, secretsClient *setecClient.Client) (*proxy, error) {
 	bs, err := os.ReadFile(upstreamCAPath)
 	if err != nil {
 		return nil, err
@@ -151,6 +179,7 @@ func newProxy(upstreamAddr, upstreamCAPath string, client *local.Client) (*proxy
 		upstreamCertPool: upstreamCertPool,
 		downstreamCert:   []tls.Certificate{downstreamCert},
 		client:           client,
+		secretsClient:    secretsClient,
 		errors:           metrics.LabelMap{Label: "kind"},
 	}, nil
 }
@@ -420,8 +449,18 @@ func (p *proxy) interceptAuth(frontend *pgproto3.Frontend, backend *pgproto3.Bac
 		postgresUser = startup.Parameters["user"]
 		postgresPass = startup.Parameters["password"]
 	} else {
-		postgresUser = "ro"
-		postgresPass = "my-secret"
+		roUser, err := p.secretsClient.Get(context.Background(), "prod/db/ro-user")
+		if err != nil {
+			return fmt.Errorf("failed to get secret: %v", err)
+		}
+		postgresUser = string(roUser.Value)
+
+		roPass, err := p.secretsClient.Get(context.Background(), "prod/db/ro-pass")
+		if err != nil {
+			return fmt.Errorf("failed to get secret: %v", err)
+		}
+		postgresPass = string(roPass.Value)
+
 		if tailscaleUser == "foo" { // Here we can check which users have read/write permissions
 			postgresUser = "rw"
 			postgresPass = "do-not-share"
